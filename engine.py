@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
-from schema import ParserState, Sentence, ParserConfig
+from schema import ParserState, Sentence
+from config import ParserConfig
 
 
 def init_state(sentence_len: int, max_stack: int, max_buffer: int) -> ParserState:
@@ -89,21 +90,29 @@ def extract_features(
     child_idx = matches[rank]
     return jnp.where((child_idx == 999) | (child_idx == -1), -1, child_idx)
 
-  # 1. Basic Stack and Buffer positions
+  # 1. Basic Stack and Buffer positions using jnp.where
   s0 = state.stack[state.stack_ptr]
-  s1 = state.stack[state.stack_ptr - 1] if state.stack_ptr >= 1 else -1
-  s2 = state.stack[state.stack_ptr - 2] if state.stack_ptr >= 2 else -1
 
-  b0 = state.buffer[state.buffer_ptr] if state.buffer_ptr < len(state.buffer) else -1
-  b1 = (
-    state.buffer[state.buffer_ptr + 1]
-    if state.buffer_ptr + 1 < len(state.buffer)
-    else -1
+  # Use jnp.where instead of Python if/else
+  s1 = jnp.where(
+    state.stack_ptr >= 1, state.stack[jnp.maximum(0, state.stack_ptr - 1)], -1
   )
-  b2 = (
-    state.buffer[state.buffer_ptr + 2]
-    if state.buffer_ptr + 2 < len(state.buffer)
-    else -1
+  s2 = jnp.where(
+    state.stack_ptr >= 2, state.stack[jnp.maximum(0, state.stack_ptr - 2)], -1
+  )
+
+  b0 = jnp.where(
+    state.buffer_ptr < state.buffer.shape[0], state.buffer[state.buffer_ptr], -1
+  )
+  b1 = jnp.where(
+    state.buffer_ptr + 1 < state.buffer.shape[0],
+    state.buffer[jnp.minimum(state.buffer.shape[0] - 1, state.buffer_ptr + 1)],
+    -1,
+  )
+  b2 = jnp.where(
+    state.buffer_ptr + 2 < state.buffer.shape[0],
+    state.buffer[jnp.minimum(state.buffer.shape[0] - 1, state.buffer_ptr + 2)],
+    -1,
   )
 
   # 2. First and second order children logic
