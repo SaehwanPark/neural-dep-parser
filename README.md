@@ -71,7 +71,7 @@ Evaluation is accelerated using `jax.vmap`, allowing the parser to process hundr
 Execute the training loop, which will automatically generate oracle instances, train the model, and evaluate UAS on the development set:
 
 ```bash
-uv run python run.py
+uv run run.py
 
 ```
 
