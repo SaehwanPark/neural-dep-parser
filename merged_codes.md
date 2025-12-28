@@ -114,28 +114,38 @@ def vectorize_sentences(
 ) -> List[Sentence]:
   """
   Converts raw string data into fixed-width jnp arrays.
+  Corrected to handle specific prefix keys and padding correctly.
   """
   sentences = []
   for ex in raw_data:
     n = len(ex["word"])
-    # Padding logic: Using 0 for padding in this example
+    # Padding logic: Using -1 for position padding to distinguish from index 0 (ROOT)
     words = np.zeros(max_len, dtype=np.int32)
     pos = np.zeros(max_len, dtype=np.int32)
     heads = np.full(max_len, -1, dtype=np.int32)
 
-    # Map tokens to IDs (with UNK handling)
+    # 1. Map tokens to IDs using the specific prefixes defined in build_vocab
     for i in range(min(n, max_len)):
+      # Word mapping
       words[i] = vocab.word2id.get(ex["word"][i], vocab.word2id["<UNK>"])
-      pos[i] = vocab.pos2id.get(ex["pos"][i], vocab.pos2id["<P_UNK>"])
+
+      # POS mapping - corrected to use the "<p>:" prefix defined in build_vocab
+      pos_key = f"<p>:{ex['pos'][i]}"
+      pos[i] = vocab.pos2id.get(pos_key, vocab.pos2id["<p>:<UNK>"])
+
+      # Head mapping
       heads[i] = ex["head"][i]
 
+    # 2. Create boolean mask for JAX-compatible loss calculation
     mask = np.arange(max_len) < n
+
     sentences.append(
       Sentence(
         words=jnp.array(words),
         pos=jnp.array(pos),
         heads=jnp.array(heads),
-        labels=jnp.zeros(max_len, dtype=np.int32),  # Simplified labels for now
+        # Labels are currently simplified to zeros as per previous implementation
+        labels=jnp.zeros(max_len, dtype=np.int32),
         mask=jnp.array(mask),
       )
     )
@@ -149,7 +159,8 @@ def vectorize_sentences(
 ```python
 import jax
 import jax.numpy as jnp
-from schema import ParserState, Sentence, ParserConfig
+from schema import ParserState, Sentence
+from config import ParserConfig
 
 
 def init_state(sentence_len: int, max_stack: int, max_buffer: int) -> ParserState:
@@ -238,21 +249,29 @@ def extract_features(
     child_idx = matches[rank]
     return jnp.where((child_idx == 999) | (child_idx == -1), -1, child_idx)
 
-  # 1. Basic Stack and Buffer positions
+  # 1. Basic Stack and Buffer positions using jnp.where
   s0 = state.stack[state.stack_ptr]
-  s1 = state.stack[state.stack_ptr - 1] if state.stack_ptr >= 1 else -1
-  s2 = state.stack[state.stack_ptr - 2] if state.stack_ptr >= 2 else -1
 
-  b0 = state.buffer[state.buffer_ptr] if state.buffer_ptr < len(state.buffer) else -1
-  b1 = (
-    state.buffer[state.buffer_ptr + 1]
-    if state.buffer_ptr + 1 < len(state.buffer)
-    else -1
+  # Use jnp.where instead of Python if/else
+  s1 = jnp.where(
+    state.stack_ptr >= 1, state.stack[jnp.maximum(0, state.stack_ptr - 1)], -1
   )
-  b2 = (
-    state.buffer[state.buffer_ptr + 2]
-    if state.buffer_ptr + 2 < len(state.buffer)
-    else -1
+  s2 = jnp.where(
+    state.stack_ptr >= 2, state.stack[jnp.maximum(0, state.stack_ptr - 2)], -1
+  )
+
+  b0 = jnp.where(
+    state.buffer_ptr < state.buffer.shape[0], state.buffer[state.buffer_ptr], -1
+  )
+  b1 = jnp.where(
+    state.buffer_ptr + 1 < state.buffer.shape[0],
+    state.buffer[jnp.minimum(state.buffer.shape[0] - 1, state.buffer_ptr + 1)],
+    -1,
+  )
+  b2 = jnp.where(
+    state.buffer_ptr + 2 < state.buffer.shape[0],
+    state.buffer[jnp.minimum(state.buffer.shape[0] - 1, state.buffer_ptr + 2)],
+    -1,
   )
 
   # 2. First and second order children logic
@@ -335,7 +354,7 @@ def predict_action(logits: jnp.ndarray, state: ParserState) -> int:
 ```python
 import jax
 import jax.numpy as jnp
-from engine import extract_features, apply_transition, predict_action
+from engine import extract_features, apply_transition, predict_action, init_state
 
 
 def minibatch_parse_step(params, states, sentences, model, config):
@@ -365,6 +384,52 @@ def minibatch_parse_step(params, states, sentences, model, config):
 def is_finished(states):
   """Checks if all sentences in the batch have empty buffers."""
   return jnp.all(states.buffer_ptr >= states.buffer.shape[1])
+
+
+def calculate_uas(params, dev_sentences, model, config, batch_size=1024):
+  """
+  Calculates the Unlabeled Attachment Score (UAS) on a dataset.
+  Pure function that compares predicted heads against gold heads.
+  """
+  total_correct = 0
+  total_tokens = 0
+
+  # Process the dev set in minibatches
+  for i in range(0, len(dev_sentences), batch_size):
+    batch = dev_sentences[i : i + batch_size]
+
+    # Initialize states for the entire batch
+    # max_stack and max_buffer should match your config/data_loader limits
+    states = [init_state(len(s.words), 30, 120) for s in batch]
+    # In JAX, we stack these into a single Pytree of arrays
+    states = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *states)
+
+    # Iterative parsing loop
+    while not is_finished(states):
+      states = minibatch_parse_step(params, states, batch, model, config)
+
+    # Compare dependencies with gold heads
+    # states.dependencies shape: (batch_size, max_deps, 2) -> [head, dependent]
+    for b_idx, sent in enumerate(batch):
+      # Extract predicted heads for this sentence
+      predicted_heads = jnp.full(len(sent.words), -1)
+      deps = states.dependencies[b_idx]
+
+      # Fill predicted_heads array based on dependencies
+      for head, dep in deps:
+        if dep != -1:
+          predicted_heads = predicted_heads.at[dep].set(head)
+
+      # Calculate correct attachments, ignoring padding and ROOT
+      # sent.mask identifies real tokens in the padded sequence
+      gold_heads = sent.heads
+      mask = sent.mask & (jnp.arange(len(sent.words)) > 0)  # Ignore ROOT at index 0
+
+      correct = jnp.sum((predicted_heads == gold_heads) & mask)
+      total_correct += correct
+      total_tokens += jnp.sum(mask)
+
+  return float(total_correct) / float(total_tokens)
 
 ```
 
@@ -477,6 +542,7 @@ class ParserModel(nn.Module):
 
 ```python
 import os
+import numpy as np
 import jax
 import jax.numpy as jnp
 import optax
@@ -488,6 +554,8 @@ from data_loader import load_conll_data, build_vocab, vectorize_sentences
 from parser_model import ParserModel
 from engine import init_state
 from oracle import oracle_step
+from inference import calculate_uas
+from utils import save_params, load_params
 
 
 def create_learning_pipeline(model, params, learning_rate):
@@ -527,10 +595,26 @@ def init_train_state(model, rng, vocab_size, embed_size, learning_rate):
   return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
 
+def get_minibatches(X, y, batch_size, shuffle=True):
+  """
+  Yields slices of data as minibatches.
+  Purely functional approach to data iteration.
+  """
+  data_size = len(X)
+  indices = np.arange(data_size)
+  if shuffle:
+    np.random.shuffle(indices)
+
+  for start_idx in range(0, data_size, batch_size):
+    end_idx = min(start_idx + batch_size, data_size)
+    batch_indices = indices[start_idx:end_idx]
+    yield X[batch_indices], y[batch_indices]
+
+
 def main():
   # 1. Environment and Configuration
   load_dotenv()
-  data_path = os.getenv("DATA_PATH", "./data")
+  data_path = os.getenv("DATA_PATH", "/home/saehwan/data/dep_parser")
 
   # config = ParserConfig(
   #   n_features=36,
@@ -545,7 +629,15 @@ def main():
   raw_train = load_conll_data("train.conll")
   vocab = build_vocab(raw_train)
   config = create_config(vocab)
+
+  # vectorize training data
   train_sentences = vectorize_sentences(raw_train, vocab)
+
+  # load and vectorize the development + test sets
+  raw_dev = load_conll_data("dev.conll")
+  dev_sentences = vectorize_sentences(raw_dev, vocab)
+  raw_test = load_conll_data("test.conll")
+  test_sentences = vectorize_sentences(raw_test, vocab)
 
   # 3. Model Initialization (Phase 3)
   rng = jax.random.PRNGKey(0)
@@ -579,16 +671,48 @@ def main():
       all_labels.append(label)
       p_state = next_state
 
-  # 5. Training Loop (Phase 4)
-  # Convert to JNP arrays for the training step
+  # 5. Training Loop with Minibatches
+  # Convert generated oracle instances to JNP arrays
   X_train = jnp.array(all_features)
   y_train = jnp.array(all_labels)
 
-  print("Starting Training...")
+  output_path = "results/best_model.weights"
+  best_uas = 0.0
+  batch_size = 1024  # Standard batch size for this architecture
+  print(f"Starting Training with {len(X_train)} instances...")
+
+  # Initialize the dropout RNG once, then split within the loop
+  rng = jax.random.PRNGKey(0)
+  _, dropout_rng = jax.random.split(rng)
+
   for epoch in range(1, 11):
-    # For brevity, we process as one large batch or manual minibatches
-    state, loss = train_step(state, X_train, y_train, dropout_rng)
-    print(f"Epoch {epoch}, Loss: {loss:.4f}")
+    epoch_losses = []
+
+    # Use the generator for Stochastic Gradient Descent
+    for batch_X, batch_y in get_minibatches(X_train, y_train, batch_size):
+      # Re-split dropout RNG for every step to ensure stochasticity
+      _, dropout_rng = jax.random.split(dropout_rng)
+
+      # Apply the JIT-compiled training step
+      state, loss = train_step(state, batch_X, batch_y, dropout_rng)
+      epoch_losses.append(loss)
+
+    # eval phase
+    current_uas = calculate_uas(state.params, dev_sentences, model, config)
+    avg_loss = np.mean(epoch_losses)
+    print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | Dev UAS: {current_uas * 100:.2f}%")
+
+    # save the best model
+    if current_uas > best_uas:
+      best_uas = current_uas
+      save_params(state, output_path)
+      print("New best UAS achieved!")
+
+  # final testing
+  print("\nRestoring best model for final testing...")
+  state = load_params(state, output_path)
+  test_uas = calculate_uas(state.params, test_sentences, model, config)
+  print(f"Final Test UAS: {test_uas * 100:.2f}%")
 
 
 if __name__ == "__main__":
@@ -632,6 +756,33 @@ class ParserVocab(NamedTuple):
   pos2id: Dict[str, int]
   label2id: Dict[str, int]
   id2label: Dict[int, str]
+
+```
+
+
+# `utils.py` (python)
+
+```python
+import pickle
+import os
+
+
+def save_params(state, path):
+  """Saves the model parameters to a file."""
+  # Ensure directory exists
+  os.makedirs(os.path.dirname(path), exist_ok=True)
+  with open(path, "wb") as f:
+    # We only save state.params to keep the file lightweight
+    pickle.dump(state.params, f)
+  print(f"Model parameters saved to {path}")
+
+
+def load_params(state, path):
+  """Loads parameters from a file into the current TrainState."""
+  with open(path, "rb") as f:
+    params = pickle.load(f)
+  # Returns a new state with updated parameters
+  return state.replace(params=params)
 
 ```
 
