@@ -6,13 +6,11 @@ from config import ParserConfig
 
 def init_state(sentence_len: int, max_stack: int, max_buffer: int) -> ParserState:
   """
-  Initializes ParserState.
-
-  sentence_len must be the number of valid token positions INCLUDING ROOT.
-  With the updated vectorizer: sentence_len == 1 + (#real tokens).
+  sentence_len: number of valid positions INCLUDING ROOT.
+  With vectorizer above: sentence_len == 1 + (#real tokens).
   """
-  # Buffer will contain [0, 1, 2, ..., sentence_len-1, -1, -1, ...]
-  # We still set buffer_ptr=1 so the first SHIFT takes token 1.
+  import jax.numpy as jnp
+
   buf = jnp.full((max_buffer,), -1, dtype=jnp.int32)
   valid = jnp.arange(max_buffer, dtype=jnp.int32) < sentence_len
   buf = jnp.where(valid, jnp.arange(max_buffer, dtype=jnp.int32), buf)
@@ -172,20 +170,19 @@ def extract_features(
 
 def get_legal_mask(state: ParserState) -> jnp.ndarray:
   """
-  Returns a mask for legal transitions in CLASS-ID ORDER: [S, LA, RA]
-  0: Shift, 1: Left-Arc, 2: Right-Arc
+  Mask in CLASS-ID ORDER: [SHIFT, LEFT-ARC, RIGHT-ARC]
+    0: SHIFT
+    1: LEFT-ARC
+    2: RIGHT-ARC
   """
-  # SHIFT: legal if next buffer token exists and isn't sentinel
+  import jax.numpy as jnp
+
   in_bounds = state.buffer_ptr < state.buffer.shape[0]
   next_tok = jnp.where(in_bounds, state.buffer[state.buffer_ptr], -1)
   can_shift = next_tok != -1
 
-  # LA: need at least 3 items on stack (ROOT + 2 tokens), and dependent != ROOT
-  # (because LA removes stack[top-1] as dependent)
-  can_la = state.stack_ptr >= 2
-
-  # RA: need at least 2 items on stack (ROOT + token)
-  can_ra = state.stack_ptr >= 1
+  can_la = state.stack_ptr >= 2  # need at least 3 items: ROOT + 2 tokens
+  can_ra = state.stack_ptr >= 1  # need at least 2 items: ROOT + token
 
   return jnp.array([can_shift, can_la, can_ra], dtype=jnp.float32)
 

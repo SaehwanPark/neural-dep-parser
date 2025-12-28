@@ -1,20 +1,19 @@
-import pickle
 import os
+import pickle
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-def save_params(state, path):
-  """Saves the model parameters to a file."""
-  # Ensure directory exists
+def save_params(state, path: str) -> None:
   os.makedirs(os.path.dirname(path), exist_ok=True)
   with open(path, "wb") as f:
-    # We only save state.params to keep the file lightweight
     pickle.dump(state.params, f)
-  print(f"Model parameters saved to {path}")
+  logger.info("Model parameters saved to %s", path)
 
 
-def load_params(state, path):
-  """Loads parameters from a file into the current TrainState."""
+def load_params(state, path: str):
   with open(path, "rb") as f:
     params = pickle.load(f)
-  # Returns a new state with updated parameters
+  logger.info("Model parameters loaded from %s", path)
   return state.replace(params=params)

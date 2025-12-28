@@ -29,8 +29,12 @@ def minibatch_parse_step(params, states, sentences, model, config):
 
 def is_finished(states):
   """
-  Checks if all sentences in the batch are finished (buffer exhausted).
+  Finished when:
+    - buffer is empty (next token is -1 or ptr out of bounds)
+    - and stack reduced to ROOT only (stack_ptr == 0)
   """
+  import jax.numpy as jnp
+
   buf = states.buffer
   bptr = states.buffer_ptr
   max_len = buf.shape[1]
@@ -38,8 +42,9 @@ def is_finished(states):
   clipped = jnp.minimum(bptr, max_len - 1)
   next_tok = jnp.take_along_axis(buf, clipped[:, None], axis=1)[:, 0]
 
-  done = (bptr >= max_len) | (next_tok == -1)
-  return jnp.all(done)
+  buffer_empty = (bptr >= max_len) | (next_tok == -1)
+  stack_done = states.stack_ptr == 0
+  return jnp.all(buffer_empty & stack_done)
 
 
 def calculate_uas(params, dev_sentences, model, config, batch_size=1024):
@@ -48,40 +53,29 @@ def calculate_uas(params, dev_sentences, model, config, batch_size=1024):
 
   for i in range(0, len(dev_sentences), batch_size):
     batch_list = dev_sentences[i : i + batch_size]
-
-    # 1. Properly stack the Sentences into a single Pytree of arrays
-    # This ensures that batch.words has shape (batch_size, max_len)
     batch = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *batch_list)
 
-    # 2. Initialize states and stack them
-    # Ensure max_stack (30) and max_buffer (120) match your data_loader limits
     states_list = [init_state(int(jnp.sum(s.mask)) + 1, 30, 120) for s in batch_list]
     states = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *states_list)
 
-    # Iterative parsing loop
     steps = 0
-    while not is_finished(states) and steps < 250:  # Added safety timeout
+    while not is_finished(states) and steps < 400:
       states = minibatch_parse_step(params, states, batch, model, config)
       steps += 1
 
-    # 3. Compare dependencies
     for b_idx in range(len(batch_list)):
       sent = batch_list[b_idx]
       predicted_heads = jnp.full(len(sent.words), -1)
       deps = states.dependencies[b_idx]
 
       for head, dep in deps:
-        # Note: dep is the index of the child, head is the index of the parent
-        # We use jnp.where or a check to avoid -1 indices
         if dep != -1:
           predicted_heads = predicted_heads.at[dep].set(head)
 
-      # Calculate correct attachments, ignoring padding and ROOT (index 0)
       gold_heads = sent.heads
       mask = sent.mask & (jnp.arange(len(sent.words)) > 0)
 
-      correct = jnp.sum((predicted_heads == gold_heads) & mask)
-      total_correct += correct
+      total_correct += jnp.sum((predicted_heads == gold_heads) & mask)
       total_tokens += jnp.sum(mask)
 
   return float(total_correct) / float(total_tokens)

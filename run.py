@@ -3,6 +3,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import optax
+import logging
+
 from dotenv import load_dotenv
 from flax.training import train_state
 
@@ -13,6 +15,8 @@ from engine import init_state
 from oracle import oracle_step
 from inference import calculate_uas
 from utils import save_params, load_params
+
+logger = logging.getLogger(__name__)
 
 
 def create_learning_pipeline(model, params, learning_rate):
@@ -69,34 +73,35 @@ def get_minibatches(X, y, batch_size, shuffle=True):
 
 
 def main():
-  # 1. Environment and Configuration
+  logger = logging.getLogger(__name__)
+  logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+  )
+
   load_dotenv()
   data_path = os.getenv("DATA_PATH", "/home/saehwan/data/dep_parser")
+  logger.info("Loading data from %s...", data_path)
 
-  # config = ParserConfig(
-  #   n_features=36,
-  #   hidden_size=200,
-  #   n_classes=3,
-  #   embed_size=50,
-  #   dropout_rate=0.5
-  # )
-
-  # 2. Data Loading (Phase 1)
-  print(f"Loading data from {data_path}...")
   raw_train = load_conll_data("train.conll")
   vocab = build_vocab(raw_train)
   config = create_config(vocab)
 
-  # vectorize training data
   train_sentences = vectorize_sentences(raw_train, vocab)
 
-  # load and vectorize the development + test sets
   raw_dev = load_conll_data("dev.conll")
   dev_sentences = vectorize_sentences(raw_dev, vocab)
+
   raw_test = load_conll_data("test.conll")
   test_sentences = vectorize_sentences(raw_test, vocab)
 
-  # 3. Model Initialization (Phase 3)
+  logger.info(
+    "Train sentences: %d | Dev: %d | Test: %d",
+    len(train_sentences),
+    len(dev_sentences),
+    len(test_sentences),
+  )
+
   rng = jax.random.PRNGKey(0)
   model_rng, dropout_rng = jax.random.split(rng)
   max_id = max(max(vocab.word2id.values()), max(vocab.pos2id.values()))
@@ -113,68 +118,76 @@ def main():
     model, model_rng, model.vocab_size, config.embed_size, 0.0005
   )
 
-  # 4. Generate Training Instances (Oracle logic)
-  print("Generating training instances via Oracle...")
-  # In a production setting, this would be lazily generated or cached
-  # but here we follow the HW logic of pre-creating instances
+  logger.info("Generating training instances via Oracle...")
   all_features = []
   all_labels = []
 
-  for sent in train_sentences[:500]:  # Using a subset for demonstration
+  # Optional cap to avoid OOM while debugging:
+  # cap = int(os.getenv("TRAIN_SENT_CAP", "0"))
+  # iterable = train_sentences[:cap] if cap > 0 else train_sentences
+  iterable = train_sentences
+
+  for sent_idx, sent in enumerate(iterable):
     sent_len = int(jnp.sum(sent.mask)) + 1
     p_state = init_state(sent_len, 30, 120)
 
-    # Iterate until buffer is empty
     step_count = 0
-    while p_state.buffer_ptr < len(sent.words) and step_count < 240:
+    while step_count < 400:
+      # finished when buffer empty and stack reduced
+      if p_state.buffer_ptr >= p_state.buffer.shape[0]:
+        buffer_empty = True
+      else:
+        buffer_empty = p_state.buffer[p_state.buffer_ptr] == -1
+
+      if buffer_empty and p_state.stack_ptr == 0:
+        break
+
       feats, label, next_state = oracle_step(p_state, sent, config)
-      all_features.append(feats)
-      all_labels.append(label)
+      all_features.append(np.array(feats, dtype=np.int32))
+      all_labels.append(int(label))
       p_state = next_state
       step_count += 1
 
-  # 5. Training Loop with Minibatches
-  # Convert generated oracle instances to JNP arrays
-  X_train = jnp.array(all_features)
-  y_train = jnp.array(all_labels)
+    if (sent_idx + 1) % 2000 == 0:
+      logger.info(
+        "Processed %d sentences; instances so far: %d", sent_idx + 1, len(all_labels)
+      )
+
+  X_train = jnp.array(np.stack(all_features, axis=0))
+  y_train = jnp.array(np.array(all_labels, dtype=np.int32))
+
+  logger.info("Starting Training with %d instances...", int(X_train.shape[0]))
 
   output_path = "results/best_model.weights"
   best_uas = 0.0
-  batch_size = 1024  # Standard batch size for this architecture
-  print(f"Starting Training with {len(X_train)} instances...")
+  batch_size = 1024
 
-  # Initialize the dropout RNG once, then split within the loop
   rng = jax.random.PRNGKey(0)
   _, dropout_rng = jax.random.split(rng)
 
   for epoch in range(1, 11):
     epoch_losses = []
 
-    # Use the generator for Stochastic Gradient Descent
     for batch_X, batch_y in get_minibatches(X_train, y_train, batch_size):
-      # Re-split dropout RNG for every step to ensure stochasticity
       _, dropout_rng = jax.random.split(dropout_rng)
-
-      # Apply the JIT-compiled training step
       state, loss = train_step(state, batch_X, batch_y, dropout_rng)
       epoch_losses.append(loss)
 
-    # eval phase
     current_uas = calculate_uas(state.params, dev_sentences, model, config)
-    avg_loss = np.mean(epoch_losses)
-    print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | Dev UAS: {current_uas * 100:.2f}%")
+    avg_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+    logger.info(
+      "Epoch %d | Loss: %.4f | Dev UAS: %.2f%%", epoch, avg_loss, current_uas * 100.0
+    )
 
-    # save the best model
     if current_uas > best_uas:
       best_uas = current_uas
       save_params(state, output_path)
-      print("New best UAS achieved!")
+      logger.info("New best UAS achieved!")
 
-  # final testing
-  print("\nRestoring best model for final testing...")
+  logger.info("Restoring best model for final testing...")
   state = load_params(state, output_path)
   test_uas = calculate_uas(state.params, test_sentences, model, config)
-  print(f"Final Test UAS: {test_uas * 100:.2f}%")
+  logger.info("Final Test UAS: %.2f%%", test_uas * 100.0)
 
 
 if __name__ == "__main__":

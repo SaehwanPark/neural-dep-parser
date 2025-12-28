@@ -114,41 +114,54 @@ def vectorize_sentences(
 ) -> List[Sentence]:
   """
   Converts raw string data into fixed-width jnp arrays.
-  Corrected to handle specific prefix keys and padding correctly.
+
+  Indexing invariant after this:
+  - position 0 is ROOT
+  - real tokens are in positions 1..n (matching CoNLL token IDs)
+  - mask is True for 1..n only (False for ROOT and padding)
   """
   sentences = []
+  null_w = vocab.word2id["<NULL>"]
+  null_p = vocab.pos2id["<p>:<NULL>"]
+  root_w = vocab.word2id["<ROOT>"]
+  root_p = vocab.pos2id["<p>:<ROOT>"]
+
   for ex in raw_data:
     n = len(ex["word"])
-    # Padding logic: Using -1 for position padding to distinguish from index 0 (ROOT)
-    words = np.zeros(max_len, dtype=np.int32)
-    pos = np.zeros(max_len, dtype=np.int32)
+    # We store ROOT + up to (max_len - 1) tokens
+    n_store = min(n, max_len - 1)
+
+    words = np.full(max_len, null_w, dtype=np.int32)
+    pos = np.full(max_len, null_p, dtype=np.int32)
     heads = np.full(max_len, -1, dtype=np.int32)
 
-    # 1. Map tokens to IDs using the specific prefixes defined in build_vocab
-    for i in range(min(n, max_len)):
-      # Word mapping
-      words[i] = vocab.word2id.get(ex["word"][i], vocab.word2id["<UNK>"])
+    # ROOT at 0
+    words[0] = root_w
+    pos[0] = root_p
+    heads[0] = -1
 
-      # POS mapping - corrected to use the "<p>:" prefix defined in build_vocab
+    # Tokens at 1..n_store (so indices match CoNLL 1..n)
+    for i in range(n_store):
+      j = i + 1
+      words[j] = vocab.word2id.get(ex["word"][i], vocab.word2id["<UNK>"])
       pos_key = f"<p>:{ex['pos'][i]}"
-      pos[i] = vocab.pos2id.get(pos_key, vocab.pos2id["<p>:<UNK>"])
+      pos[j] = vocab.pos2id.get(pos_key, vocab.pos2id["<p>:<UNK>"])
+      heads[j] = ex["head"][i]  # CoNLL head indices already use 0=ROOT
 
-      # Head mapping
-      heads[i] = ex["head"][i]
-
-    # 2. Create boolean mask for JAX-compatible loss calculation
-    mask = np.arange(max_len) < n
+    # mask True for real tokens only (exclude ROOT and padding)
+    mask = np.zeros(max_len, dtype=bool)
+    mask[1 : (n_store + 1)] = True
 
     sentences.append(
       Sentence(
         words=jnp.array(words),
         pos=jnp.array(pos),
         heads=jnp.array(heads),
-        # Labels are currently simplified to zeros as per previous implementation
         labels=jnp.zeros(max_len, dtype=np.int32),
         mask=jnp.array(mask),
       )
     )
+
   return sentences
 
 ```
@@ -165,16 +178,23 @@ from config import ParserConfig
 
 def init_state(sentence_len: int, max_stack: int, max_buffer: int) -> ParserState:
   """
-  Initializes the ParserState for a new sentence.
+  Initializes ParserState.
+
+  sentence_len must be the number of valid token positions INCLUDING ROOT.
+  With the updated vectorizer: sentence_len == 1 + (#real tokens).
   """
-  # The buffer initially contains all word indices (1 to sentence_len)
-  # The stack starts with the ROOT token (index 0)
+  # Buffer will contain [0, 1, 2, ..., sentence_len-1, -1, -1, ...]
+  # We still set buffer_ptr=1 so the first SHIFT takes token 1.
+  buf = jnp.full((max_buffer,), -1, dtype=jnp.int32)
+  valid = jnp.arange(max_buffer, dtype=jnp.int32) < sentence_len
+  buf = jnp.where(valid, jnp.arange(max_buffer, dtype=jnp.int32), buf)
+
   return ParserState(
     stack=jnp.zeros(max_stack, dtype=jnp.int32).at[0].set(0),
-    buffer=jnp.arange(max_buffer, dtype=jnp.int32),
+    buffer=buf,
     dependencies=jnp.full((max_buffer, 2), -1, dtype=jnp.int32),
-    stack_ptr=0,  # Points to the top of the stack (0-based)
-    buffer_ptr=1,  # Points to the next available word in the buffer
+    stack_ptr=0,
+    buffer_ptr=1,
     num_deps=0,
   )
 
@@ -324,16 +344,22 @@ def extract_features(
 
 def get_legal_mask(state: ParserState) -> jnp.ndarray:
   """
-  Returns a mask for legal transitions: [LA, RA, S]
-  - Left-Arc: Legal if stack has at least 2 items (not including ROOT only)
-  - Right-Arc: Legal if stack has at least 2 items
-  - Shift: Legal if buffer is not empty
+  Returns a mask for legal transitions in CLASS-ID ORDER: [S, LA, RA]
+  0: Shift, 1: Left-Arc, 2: Right-Arc
   """
-  can_la = state.stack_ptr >= 2
-  can_ra = state.stack_ptr >= 1
-  can_shift = state.buffer_ptr < len(state.buffer)
+  # SHIFT: legal if next buffer token exists and isn't sentinel
+  in_bounds = state.buffer_ptr < state.buffer.shape[0]
+  next_tok = jnp.where(in_bounds, state.buffer[state.buffer_ptr], -1)
+  can_shift = next_tok != -1
 
-  return jnp.array([can_la, can_ra, can_shift], dtype=jnp.float32)
+  # LA: need at least 3 items on stack (ROOT + 2 tokens), and dependent != ROOT
+  # (because LA removes stack[top-1] as dependent)
+  can_la = state.stack_ptr >= 2
+
+  # RA: need at least 2 items on stack (ROOT + token)
+  can_ra = state.stack_ptr >= 1
+
+  return jnp.array([can_shift, can_la, can_ra], dtype=jnp.float32)
 
 
 def predict_action(logits: jnp.ndarray, state: ParserState) -> int:
@@ -382,8 +408,18 @@ def minibatch_parse_step(params, states, sentences, model, config):
 
 
 def is_finished(states):
-  """Checks if all sentences in the batch have empty buffers."""
-  return jnp.all(states.buffer_ptr >= states.buffer.shape[1])
+  """
+  Checks if all sentences in the batch are finished (buffer exhausted).
+  """
+  buf = states.buffer
+  bptr = states.buffer_ptr
+  max_len = buf.shape[1]
+
+  clipped = jnp.minimum(bptr, max_len - 1)
+  next_tok = jnp.take_along_axis(buf, clipped[:, None], axis=1)[:, 0]
+
+  done = (bptr >= max_len) | (next_tok == -1)
+  return jnp.all(done)
 
 
 def calculate_uas(params, dev_sentences, model, config, batch_size=1024):
@@ -399,7 +435,7 @@ def calculate_uas(params, dev_sentences, model, config, batch_size=1024):
 
     # 2. Initialize states and stack them
     # Ensure max_stack (30) and max_buffer (120) match your data_loader limits
-    states_list = [init_state(len(s.words), 30, 120) for s in batch_list]
+    states_list = [init_state(int(jnp.sum(s.mask)) + 1, 30, 120) for s in batch_list]
     states = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *states_list)
 
     # Iterative parsing loop
@@ -442,23 +478,30 @@ from engine import extract_features, apply_transition
 
 
 def get_gold_transition(state: ParserState, sentence: Sentence) -> int:
-  # Logic: 0: Shift, 1: Left-Arc, 2: Right-Arc
+  # 0: Shift, 1: Left-Arc, 2: Right-Arc
 
+  # If stack has only ROOT (or empty), we must SHIFT if possible
   if state.stack_ptr < 1:
-    return 0  # SHIFT (0)
+    # If buffer is already empty, there's nothing sensible to do; default SHIFT.
+    return 0
 
-  s1 = state.stack[state.stack_ptr]
-  s2 = state.stack[state.stack_ptr - 1]
+  s1 = state.stack[state.stack_ptr]  # top
+  s2 = state.stack[state.stack_ptr - 1]  # second top
 
+  # LEFT-ARC: s2 <- s1 (s1 is head of s2), and s2 cannot be ROOT
   if s2 > 0 and sentence.heads[s2] == s1:
-    return 1  # LEFT-ARC (1)
+    return 1
 
+  # RIGHT-ARC: s2 -> s1 (s2 is head of s1), but only if s1 has no dependents left in buffer
   if sentence.heads[s1] == s2:
-    has_buffer_dependents = jnp.any(sentence.heads[state.buffer_ptr :] == s1)
+    # Remaining token indices in buffer (exclude sentinels)
+    rem = state.buffer[state.buffer_ptr :]
+    rem = rem[rem != -1]
+    has_buffer_dependents = jnp.any(sentence.heads[rem] == s1)
     if not has_buffer_dependents:
-      return 2  # RIGHT-ARC (2)
+      return 2
 
-  return 0  # SHIFT (0)
+  return 0
 
 
 def oracle_step(state: ParserState, sentence: Sentence, config) -> tuple:
@@ -655,7 +698,9 @@ def main():
   all_labels = []
 
   for sent in train_sentences[:500]:  # Using a subset for demonstration
-    p_state = init_state(len(sent.words), 30, 120)
+    sent_len = int(jnp.sum(sent.mask)) + 1
+    p_state = init_state(sent_len, 30, 120)
+
     # Iterate until buffer is empty
     step_count = 0
     while p_state.buffer_ptr < len(sent.words) and step_count < 240:
