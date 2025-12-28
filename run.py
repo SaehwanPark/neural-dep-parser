@@ -119,14 +119,16 @@ def main():
   all_features = []
   all_labels = []
 
-  for sent in train_sentences[:1000]:  # Using a subset for demonstration
+  for sent in train_sentences[:500]:  # Using a subset for demonstration
     p_state = init_state(len(sent.words), 30, 120)
     # Iterate until buffer is empty
-    while p_state.buffer_ptr < len(sent.words):
+    step_count = 0
+    while p_state.buffer_ptr < len(sent.words) and step_count < 240:
       feats, label, next_state = oracle_step(p_state, sent, config)
       all_features.append(feats)
       all_labels.append(label)
       p_state = next_state
+      step_count += 1
 
   # 5. Training Loop with Minibatches
   # Convert generated oracle instances to JNP arrays

@@ -4,31 +4,23 @@ from engine import extract_features, apply_transition
 
 
 def get_gold_transition(state: ParserState, sentence: Sentence) -> int:
-  """
-  Determines the correct transition to take based on the gold heads.
-  Returns: 0 (LA), 1 (RA), or 2 (S).
-  """
-  if state.stack_ptr < 1:  # Only ROOT on stack
-    return 2  # SHIFT
+  # Logic: 0: Shift, 1: Left-Arc, 2: Right-Arc
 
-  # Indices of the top two elements on the stack
-  s1 = state.stack[state.stack_ptr]  # top
-  s2 = state.stack[state.stack_ptr - 1]  # second top
+  if state.stack_ptr < 1:
+    return 0  # SHIFT (0)
 
-  # Check if s2's head is s1 (Left-Arc)
-  # Note: index 0 is ROOT, so we don't Left-Arc the ROOT
+  s1 = state.stack[state.stack_ptr]
+  s2 = state.stack[state.stack_ptr - 1]
+
   if s2 > 0 and sentence.heads[s2] == s1:
-    return 0  # LEFT-ARC
+    return 1  # LEFT-ARC (1)
 
-  # Check if s1's head is s2 (Right-Arc)
-  # AND ensure s1 has no more dependents left in the buffer
   if sentence.heads[s1] == s2:
-    # Check buffer for any word whose head is s1
     has_buffer_dependents = jnp.any(sentence.heads[state.buffer_ptr :] == s1)
     if not has_buffer_dependents:
-      return 1  # RIGHT-ARC
+      return 2  # RIGHT-ARC (2)
 
-  return 2  # SHIFT
+  return 0  # SHIFT (0)
 
 
 def oracle_step(state: ParserState, sentence: Sentence, config) -> tuple:
