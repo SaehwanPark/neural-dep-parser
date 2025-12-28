@@ -6,16 +6,23 @@ from config import ParserConfig
 
 def init_state(sentence_len: int, max_stack: int, max_buffer: int) -> ParserState:
   """
-  Initializes the ParserState for a new sentence.
+  Initializes ParserState.
+
+  sentence_len must be the number of valid token positions INCLUDING ROOT.
+  With the updated vectorizer: sentence_len == 1 + (#real tokens).
   """
-  # The buffer initially contains all word indices (1 to sentence_len)
-  # The stack starts with the ROOT token (index 0)
+  # Buffer will contain [0, 1, 2, ..., sentence_len-1, -1, -1, ...]
+  # We still set buffer_ptr=1 so the first SHIFT takes token 1.
+  buf = jnp.full((max_buffer,), -1, dtype=jnp.int32)
+  valid = jnp.arange(max_buffer, dtype=jnp.int32) < sentence_len
+  buf = jnp.where(valid, jnp.arange(max_buffer, dtype=jnp.int32), buf)
+
   return ParserState(
     stack=jnp.zeros(max_stack, dtype=jnp.int32).at[0].set(0),
-    buffer=jnp.arange(max_buffer, dtype=jnp.int32),
+    buffer=buf,
     dependencies=jnp.full((max_buffer, 2), -1, dtype=jnp.int32),
-    stack_ptr=0,  # Points to the top of the stack (0-based)
-    buffer_ptr=1,  # Points to the next available word in the buffer
+    stack_ptr=0,
+    buffer_ptr=1,
     num_deps=0,
   )
 
@@ -165,16 +172,22 @@ def extract_features(
 
 def get_legal_mask(state: ParserState) -> jnp.ndarray:
   """
-  Returns a mask for legal transitions: [LA, RA, S]
-  - Left-Arc: Legal if stack has at least 2 items (not including ROOT only)
-  - Right-Arc: Legal if stack has at least 2 items
-  - Shift: Legal if buffer is not empty
+  Returns a mask for legal transitions in CLASS-ID ORDER: [S, LA, RA]
+  0: Shift, 1: Left-Arc, 2: Right-Arc
   """
-  can_la = state.stack_ptr >= 2
-  can_ra = state.stack_ptr >= 1
-  can_shift = state.buffer_ptr < len(state.buffer)
+  # SHIFT: legal if next buffer token exists and isn't sentinel
+  in_bounds = state.buffer_ptr < state.buffer.shape[0]
+  next_tok = jnp.where(in_bounds, state.buffer[state.buffer_ptr], -1)
+  can_shift = next_tok != -1
 
-  return jnp.array([can_la, can_ra, can_shift], dtype=jnp.float32)
+  # LA: need at least 3 items on stack (ROOT + 2 tokens), and dependent != ROOT
+  # (because LA removes stack[top-1] as dependent)
+  can_la = state.stack_ptr >= 2
+
+  # RA: need at least 2 items on stack (ROOT + token)
+  can_ra = state.stack_ptr >= 1
+
+  return jnp.array([can_shift, can_la, can_ra], dtype=jnp.float32)
 
 
 def predict_action(logits: jnp.ndarray, state: ParserState) -> int:

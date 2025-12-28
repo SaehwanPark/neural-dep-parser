@@ -387,43 +387,42 @@ def is_finished(states):
 
 
 def calculate_uas(params, dev_sentences, model, config, batch_size=1024):
-  """
-  Calculates the Unlabeled Attachment Score (UAS) on a dataset.
-  Pure function that compares predicted heads against gold heads.
-  """
   total_correct = 0
   total_tokens = 0
 
-  # Process the dev set in minibatches
   for i in range(0, len(dev_sentences), batch_size):
-    batch = dev_sentences[i : i + batch_size]
+    batch_list = dev_sentences[i : i + batch_size]
 
-    # Initialize states for the entire batch
-    # max_stack and max_buffer should match your config/data_loader limits
-    states = [init_state(len(s.words), 30, 120) for s in batch]
-    # In JAX, we stack these into a single Pytree of arrays
-    states = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *states)
+    # 1. Properly stack the Sentences into a single Pytree of arrays
+    # This ensures that batch.words has shape (batch_size, max_len)
+    batch = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *batch_list)
+
+    # 2. Initialize states and stack them
+    # Ensure max_stack (30) and max_buffer (120) match your data_loader limits
+    states_list = [init_state(len(s.words), 30, 120) for s in batch_list]
+    states = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *states_list)
 
     # Iterative parsing loop
-    while not is_finished(states):
+    steps = 0
+    while not is_finished(states) and steps < 250:  # Added safety timeout
       states = minibatch_parse_step(params, states, batch, model, config)
+      steps += 1
 
-    # Compare dependencies with gold heads
-    # states.dependencies shape: (batch_size, max_deps, 2) -> [head, dependent]
-    for b_idx, sent in enumerate(batch):
-      # Extract predicted heads for this sentence
+    # 3. Compare dependencies
+    for b_idx in range(len(batch_list)):
+      sent = batch_list[b_idx]
       predicted_heads = jnp.full(len(sent.words), -1)
       deps = states.dependencies[b_idx]
 
-      # Fill predicted_heads array based on dependencies
       for head, dep in deps:
+        # Note: dep is the index of the child, head is the index of the parent
+        # We use jnp.where or a check to avoid -1 indices
         if dep != -1:
           predicted_heads = predicted_heads.at[dep].set(head)
 
-      # Calculate correct attachments, ignoring padding and ROOT
-      # sent.mask identifies real tokens in the padded sequence
+      # Calculate correct attachments, ignoring padding and ROOT (index 0)
       gold_heads = sent.heads
-      mask = sent.mask & (jnp.arange(len(sent.words)) > 0)  # Ignore ROOT at index 0
+      mask = sent.mask & (jnp.arange(len(sent.words)) > 0)
 
       correct = jnp.sum((predicted_heads == gold_heads) & mask)
       total_correct += correct
@@ -443,31 +442,23 @@ from engine import extract_features, apply_transition
 
 
 def get_gold_transition(state: ParserState, sentence: Sentence) -> int:
-  """
-  Determines the correct transition to take based on the gold heads.
-  Returns: 0 (LA), 1 (RA), or 2 (S).
-  """
-  if state.stack_ptr < 1:  # Only ROOT on stack
-    return 2  # SHIFT
+  # Logic: 0: Shift, 1: Left-Arc, 2: Right-Arc
 
-  # Indices of the top two elements on the stack
-  s1 = state.stack[state.stack_ptr]  # top
-  s2 = state.stack[state.stack_ptr - 1]  # second top
+  if state.stack_ptr < 1:
+    return 0  # SHIFT (0)
 
-  # Check if s2's head is s1 (Left-Arc)
-  # Note: index 0 is ROOT, so we don't Left-Arc the ROOT
+  s1 = state.stack[state.stack_ptr]
+  s2 = state.stack[state.stack_ptr - 1]
+
   if s2 > 0 and sentence.heads[s2] == s1:
-    return 0  # LEFT-ARC
+    return 1  # LEFT-ARC (1)
 
-  # Check if s1's head is s2 (Right-Arc)
-  # AND ensure s1 has no more dependents left in the buffer
   if sentence.heads[s1] == s2:
-    # Check buffer for any word whose head is s1
     has_buffer_dependents = jnp.any(sentence.heads[state.buffer_ptr :] == s1)
     if not has_buffer_dependents:
-      return 1  # RIGHT-ARC
+      return 2  # RIGHT-ARC (2)
 
-  return 2  # SHIFT
+  return 0  # SHIFT (0)
 
 
 def oracle_step(state: ParserState, sentence: Sentence, config) -> tuple:
@@ -642,9 +633,10 @@ def main():
   # 3. Model Initialization (Phase 3)
   rng = jax.random.PRNGKey(0)
   model_rng, dropout_rng = jax.random.split(rng)
+  max_id = max(max(vocab.word2id.values()), max(vocab.pos2id.values()))
 
   model = ParserModel(
-    vocab_size=len(vocab.word2id) + len(vocab.pos2id),
+    vocab_size=max_id + 1,
     embed_size=config.embed_size,
     hidden_size=config.hidden_size,
     n_classes=config.n_classes,
@@ -662,14 +654,16 @@ def main():
   all_features = []
   all_labels = []
 
-  for sent in train_sentences[:1000]:  # Using a subset for demonstration
+  for sent in train_sentences[:500]:  # Using a subset for demonstration
     p_state = init_state(len(sent.words), 30, 120)
     # Iterate until buffer is empty
-    while p_state.buffer_ptr < len(sent.words):
+    step_count = 0
+    while p_state.buffer_ptr < len(sent.words) and step_count < 240:
       feats, label, next_state = oracle_step(p_state, sent, config)
       all_features.append(feats)
       all_labels.append(label)
       p_state = next_state
+      step_count += 1
 
   # 5. Training Loop with Minibatches
   # Convert generated oracle instances to JNP arrays

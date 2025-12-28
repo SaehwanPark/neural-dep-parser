@@ -99,9 +99,10 @@ def main():
   # 3. Model Initialization (Phase 3)
   rng = jax.random.PRNGKey(0)
   model_rng, dropout_rng = jax.random.split(rng)
+  max_id = max(max(vocab.word2id.values()), max(vocab.pos2id.values()))
 
   model = ParserModel(
-    vocab_size=len(vocab.word2id) + len(vocab.pos2id),
+    vocab_size=max_id + 1,
     embed_size=config.embed_size,
     hidden_size=config.hidden_size,
     n_classes=config.n_classes,
@@ -120,7 +121,9 @@ def main():
   all_labels = []
 
   for sent in train_sentences[:500]:  # Using a subset for demonstration
-    p_state = init_state(len(sent.words), 30, 120)
+    sent_len = int(jnp.sum(sent.mask)) + 1
+    p_state = init_state(sent_len, 30, 120)
+
     # Iterate until buffer is empty
     step_count = 0
     while p_state.buffer_ptr < len(sent.words) and step_count < 240:

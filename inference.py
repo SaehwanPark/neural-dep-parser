@@ -28,8 +28,18 @@ def minibatch_parse_step(params, states, sentences, model, config):
 
 
 def is_finished(states):
-  """Checks if all sentences in the batch have empty buffers."""
-  return jnp.all(states.buffer_ptr >= states.buffer.shape[1])
+  """
+  Checks if all sentences in the batch are finished (buffer exhausted).
+  """
+  buf = states.buffer
+  bptr = states.buffer_ptr
+  max_len = buf.shape[1]
+
+  clipped = jnp.minimum(bptr, max_len - 1)
+  next_tok = jnp.take_along_axis(buf, clipped[:, None], axis=1)[:, 0]
+
+  done = (bptr >= max_len) | (next_tok == -1)
+  return jnp.all(done)
 
 
 def calculate_uas(params, dev_sentences, model, config, batch_size=1024):
@@ -45,7 +55,7 @@ def calculate_uas(params, dev_sentences, model, config, batch_size=1024):
 
     # 2. Initialize states and stack them
     # Ensure max_stack (30) and max_buffer (120) match your data_loader limits
-    states_list = [init_state(len(s.words), 30, 120) for s in batch_list]
+    states_list = [init_state(int(jnp.sum(s.mask)) + 1, 30, 120) for s in batch_list]
     states = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *states_list)
 
     # Iterative parsing loop

@@ -4,23 +4,30 @@ from engine import extract_features, apply_transition
 
 
 def get_gold_transition(state: ParserState, sentence: Sentence) -> int:
-  # Logic: 0: Shift, 1: Left-Arc, 2: Right-Arc
+  # 0: Shift, 1: Left-Arc, 2: Right-Arc
 
+  # If stack has only ROOT (or empty), we must SHIFT if possible
   if state.stack_ptr < 1:
-    return 0  # SHIFT (0)
+    # If buffer is already empty, there's nothing sensible to do; default SHIFT.
+    return 0
 
-  s1 = state.stack[state.stack_ptr]
-  s2 = state.stack[state.stack_ptr - 1]
+  s1 = state.stack[state.stack_ptr]  # top
+  s2 = state.stack[state.stack_ptr - 1]  # second top
 
+  # LEFT-ARC: s2 <- s1 (s1 is head of s2), and s2 cannot be ROOT
   if s2 > 0 and sentence.heads[s2] == s1:
-    return 1  # LEFT-ARC (1)
+    return 1
 
+  # RIGHT-ARC: s2 -> s1 (s2 is head of s1), but only if s1 has no dependents left in buffer
   if sentence.heads[s1] == s2:
-    has_buffer_dependents = jnp.any(sentence.heads[state.buffer_ptr :] == s1)
+    # Remaining token indices in buffer (exclude sentinels)
+    rem = state.buffer[state.buffer_ptr :]
+    rem = rem[rem != -1]
+    has_buffer_dependents = jnp.any(sentence.heads[rem] == s1)
     if not has_buffer_dependents:
-      return 2  # RIGHT-ARC (2)
+      return 2
 
-  return 0  # SHIFT (0)
+  return 0
 
 
 def oracle_step(state: ParserState, sentence: Sentence, config) -> tuple:

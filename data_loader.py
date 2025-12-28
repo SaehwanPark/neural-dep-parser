@@ -72,39 +72,52 @@ def vectorize_sentences(
 ) -> List[Sentence]:
   """
   Converts raw string data into fixed-width jnp arrays.
-  Corrected to handle specific prefix keys and padding correctly.
+
+  Indexing invariant after this:
+  - position 0 is ROOT
+  - real tokens are in positions 1..n (matching CoNLL token IDs)
+  - mask is True for 1..n only (False for ROOT and padding)
   """
   sentences = []
+  null_w = vocab.word2id["<NULL>"]
+  null_p = vocab.pos2id["<p>:<NULL>"]
+  root_w = vocab.word2id["<ROOT>"]
+  root_p = vocab.pos2id["<p>:<ROOT>"]
+
   for ex in raw_data:
     n = len(ex["word"])
-    # Padding logic: Using -1 for position padding to distinguish from index 0 (ROOT)
-    words = np.zeros(max_len, dtype=np.int32)
-    pos = np.zeros(max_len, dtype=np.int32)
+    # We store ROOT + up to (max_len - 1) tokens
+    n_store = min(n, max_len - 1)
+
+    words = np.full(max_len, null_w, dtype=np.int32)
+    pos = np.full(max_len, null_p, dtype=np.int32)
     heads = np.full(max_len, -1, dtype=np.int32)
 
-    # 1. Map tokens to IDs using the specific prefixes defined in build_vocab
-    for i in range(min(n, max_len)):
-      # Word mapping
-      words[i] = vocab.word2id.get(ex["word"][i], vocab.word2id["<UNK>"])
+    # ROOT at 0
+    words[0] = root_w
+    pos[0] = root_p
+    heads[0] = -1
 
-      # POS mapping - corrected to use the "<p>:" prefix defined in build_vocab
+    # Tokens at 1..n_store (so indices match CoNLL 1..n)
+    for i in range(n_store):
+      j = i + 1
+      words[j] = vocab.word2id.get(ex["word"][i], vocab.word2id["<UNK>"])
       pos_key = f"<p>:{ex['pos'][i]}"
-      pos[i] = vocab.pos2id.get(pos_key, vocab.pos2id["<p>:<UNK>"])
+      pos[j] = vocab.pos2id.get(pos_key, vocab.pos2id["<p>:<UNK>"])
+      heads[j] = ex["head"][i]  # CoNLL head indices already use 0=ROOT
 
-      # Head mapping
-      heads[i] = ex["head"][i]
-
-    # 2. Create boolean mask for JAX-compatible loss calculation
-    mask = np.arange(max_len) < n
+    # mask True for real tokens only (exclude ROOT and padding)
+    mask = np.zeros(max_len, dtype=bool)
+    mask[1 : (n_store + 1)] = True
 
     sentences.append(
       Sentence(
         words=jnp.array(words),
         pos=jnp.array(pos),
         heads=jnp.array(heads),
-        # Labels are currently simplified to zeros as per previous implementation
         labels=jnp.zeros(max_len, dtype=np.int32),
         mask=jnp.array(mask),
       )
     )
+
   return sentences
