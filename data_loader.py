@@ -11,7 +11,7 @@ load_dotenv()
 
 def load_conll_data(file_name: str, lowercase: bool = True) -> List[Dict]:
   """
-  Robust CoNLL(-U-ish) loader.
+  robust CoNLL(-U-ish) loader.
   - splits on any whitespace (tabs OR spaces)
   - flushes last sentence even if file doesn't end with a blank line
   - skips multiword tokens like 1-2
@@ -61,13 +61,13 @@ def load_conll_data(file_name: str, lowercase: bool = True) -> List[Dict]:
       label.append(rel)
 
   flush()
-  logger.info("Loaded %d sentences from %s", len(examples), full_path)
+  logger.info("loaded %d sentences from %s", len(examples), full_path)
   return examples
 
 
 def build_vocab(train_data: List[Dict]) -> ParserVocab:
   """
-  Builds vocabularies with disjoint ID ranges.
+  builds vocabularies with disjoint ID ranges.
   IDs are contiguous and stable.
   """
   # 1) labels
@@ -101,7 +101,7 @@ def vectorize_sentences(
   raw_data: List[Dict], vocab: ParserVocab, max_len: int = 120
 ) -> List[Sentence]:
   """
-  Indexing invariant:
+  indexing invariant:
   - position 0 is ROOT
   - real tokens are in positions 1..n (matching CoNLL token IDs)
   - mask is True for 1..n only (False for ROOT and padding)

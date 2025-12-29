@@ -3,7 +3,7 @@ import flax.linen as nn
 
 class ParserModel(nn.Module):
   """
-  Flax implementation of the Feed-Forward Dependency Parser.
+  flax implementation of the feed-forward dependency parser.
   """
 
   vocab_size: int
@@ -17,20 +17,20 @@ class ParserModel(nn.Module):
     """
     x: (batch_size, n_features) - indices of features
     """
-    # 1. Custom Embedding Lookup (Manual implementation as per requirement)
-    # We use a learnable parameter for embeddings
+    # 1. custom embedding lookup (manual implementation as per requirement)
+    # we use a learnable parameter for embeddings
     embeddings = self.param(
       "embeddings",
       nn.initializers.uniform(scale=0.1),
       (self.vocab_size, self.embed_size),
     )
 
-    # Select embeddings and flatten: (batch, n_features * embed_size)
-    # Equivalent to PyTorch's x.view(batch_size, -1)
+    # select embeddings and flatten: (batch, n_features * embed_size)
+    # equivalent to PyTorch's x.view(batch_size, -1)
     x = embeddings[x].reshape((x.shape[0], -1))
 
-    # 2. Hidden Layer: Affine -> ReLU -> Dropout
-    # We use Xavier Uniform (Glorot) for weights
+    # 2. hidden layer: affine -> relu -> dropout
+    # we use xavier uniform (glorot) for weights
     x = nn.Dense(
       features=self.hidden_size,
       kernel_init=nn.initializers.xavier_uniform(),
@@ -39,7 +39,7 @@ class ParserModel(nn.Module):
     x = nn.relu(x)
     x = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(x)
 
-    # 3. Output Layer (Logits)
+    # 3. output layer (logits)
     logits = nn.Dense(
       features=self.n_classes,
       kernel_init=nn.initializers.xavier_uniform(),

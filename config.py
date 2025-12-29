@@ -1,9 +1,15 @@
 from typing import NamedTuple
 from schema import ParserVocab
 
+# extracted constants from magic numbers
+MAX_STACK_SIZE = 30
+MAX_BUFFER_SIZE = 120
+MAX_ORACLE_STEPS = 400  # conservative upper bound for oracle trajectories
+MAX_PARSE_STEPS = 400  # conservative upper bound for inference
+
 
 class ParserConfig(NamedTuple):
-  """Constants and special IDs for the parser logic."""
+  """constants and special IDs for the parser logic."""
 
   n_features: int = 36
   hidden_size: int = 200
@@ -11,7 +17,7 @@ class ParserConfig(NamedTuple):
   embed_size: int = 50
   dropout_rate: float = 0.5
 
-  # Special IDs mapped from ParserVocab
+  # special IDs mapped from ParserVocab
   NULL_ID: int = 0
   P_NULL_ID: int = 0
   ROOT_ID: int = 0
@@ -21,7 +27,19 @@ class ParserConfig(NamedTuple):
 
 
 def create_config(vocab: ParserVocab) -> ParserConfig:
-  """Factory function to populate IDs based on the actual vocab."""
+  """factory function to populate IDs based on the actual vocab with validation."""
+  # validate required tokens exist
+  required_word_tokens = ["<NULL>", "<ROOT>", "<UNK>"]
+  required_pos_tokens = ["<p>:<NULL>", "<p>:<ROOT>", "<p>:<UNK>"]
+
+  for tok in required_word_tokens:
+    if tok not in vocab.word2id:
+      raise ValueError(f"missing required word token in vocabulary: {tok}")
+
+  for tok in required_pos_tokens:
+    if tok not in vocab.pos2id:
+      raise ValueError(f"missing required POS token in vocabulary: {tok}")
+
   return ParserConfig(
     NULL_ID=vocab.word2id["<NULL>"],
     P_NULL_ID=vocab.pos2id["<p>:<NULL>"],
