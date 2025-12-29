@@ -5,7 +5,12 @@ from engine import extract_features, apply_transition
 
 def get_gold_transition(state: ParserState, sentence: Sentence) -> int:
   """
+  returns the oracle transition for arc-standard parsing.
+
   0: SHIFT, 1: LEFT-ARC, 2: RIGHT-ARC
+
+  CRITICAL FIX: both LEFT-ARC and RIGHT-ARC now check for remaining buffer dependents
+  to ensure projectivity and correct parse trajectories.
   """
   # can we shift?
   can_shift = (state.buffer_ptr < state.buffer.shape[0]) and (
@@ -16,17 +21,28 @@ def get_gold_transition(state: ParserState, sentence: Sentence) -> int:
   if state.stack_ptr < 1:
     return 0 if can_shift else 2
 
-  s1 = state.stack[state.stack_ptr]
-  s2 = state.stack[state.stack_ptr - 1]
+  s1 = state.stack[state.stack_ptr]  # top of stack
+  s2 = state.stack[state.stack_ptr - 1]  # second from top
 
-  # LEFT-ARC: s2 <- s1 (s1 is head of s2), s2 cannot be ROOT
+  # helper: get remaining buffer tokens (exclude sentinels)
+  rem = state.buffer[state.buffer_ptr :]
+  rem = rem[rem != -1]
+
+  # LEFT-ARC: s2 <- s1 (s1 is head of s2)
+  # conditions:
+  #   1. s2 cannot be ROOT (s2 > 0)
+  #   2. gold arc exists: sentence.heads[s2] == s1
+  #   3. s2 has NO remaining dependents in buffer
   if s2 > 0 and sentence.heads[s2] == s1:
-    return 1
+    has_buffer_dependents = jnp.any(sentence.heads[rem] == s2)
+    if not has_buffer_dependents:
+      return 1
 
-  # RIGHT-ARC: s2 -> s1 (s2 is head of s1), only if s1 has no dependents remaining in buffer
+  # RIGHT-ARC: s2 -> s1 (s2 is head of s1)
+  # conditions:
+  #   1. gold arc exists: sentence.heads[s1] == s2
+  #   2. s1 has NO remaining dependents in buffer
   if sentence.heads[s1] == s2:
-    rem = state.buffer[state.buffer_ptr :]
-    rem = rem[rem != -1]
     has_buffer_dependents = jnp.any(sentence.heads[rem] == s1)
     if not has_buffer_dependents:
       return 2
@@ -37,7 +53,8 @@ def get_gold_transition(state: ParserState, sentence: Sentence) -> int:
 
 def oracle_step(state: ParserState, sentence: Sentence, config) -> tuple:
   """
-  A single step of the oracle used for generating training instances.
+  a single step of the oracle used for generating training instances.
+  returns: (features, gold_action, next_state)
   """
   features = extract_features(state, sentence, config)
   gold_action = get_gold_transition(state, sentence)
