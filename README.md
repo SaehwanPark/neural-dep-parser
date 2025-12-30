@@ -87,3 +87,13 @@ The parser uses **Unlabeled Attachment Score (UAS)**, calculating the percentage
 ## 5. Model Checkpoints
 
 The script automatically saves the parameters of the best-performing model (highest Dev UAS) to `results/best_model.weights`. These can be reloaded for final testing or deployment.
+
+---
+
+## Datasets
+
+In order to run this project,
+
+1. Download [this file](https://web.stanford.edu/class/cs224n/assignments_w25/a2.zip) from Stanford CS224n website and unpack
+2. Copy `student-1/data/` to your own data directory
+3. Make sure your environment `DATA_PATH` points to that directory
